@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Inter } from "next/font/google";
+import NextTopLoader from "nextjs-toploader";
 import { Toaster } from "sonner";
 import { QueryProvider } from "@/components/providers/query-provider";
 import "./globals.css";
@@ -22,6 +23,7 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className={`${inter.variable} antialiased`}>
+        <NextTopLoader color="#171717" showSpinner={false} height={2} />
         <QueryProvider>{children}</QueryProvider>
         <Toaster />
       </body>
