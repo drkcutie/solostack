@@ -44,19 +44,51 @@ Invoke when building any UI component, page, or layout. Produces production-grad
 
 ## Architecture
 
-### Reads: Server Components → Drizzle → Postgres
+### Data Access: src/lib/data/
+
+Shared data functions live here. Called by server components directly and by route handlers for client refetching.
+
+```tsx
+// src/lib/data/projects.ts
+import { db } from "@/lib/db";
+import { project } from "@/lib/db/schema";
+import { eq } from "drizzle-orm";
+
+export async function getProjects(userId: string) {
+  return db.select().from(project).where(eq(project.userId, userId));
+}
+```
+
+### Reads: Server Components → lib/data → Drizzle → Postgres
 
 ```tsx
 // src/app/(app)/dashboard/page.tsx
-import { db } from "@/lib/db";
-import { project } from "@/lib/db/schema";
+import { getProjects } from "@/lib/data/projects";
 import { requireAuth } from "@/lib/auth/helpers";
-import { eq } from "drizzle-orm";
 
 export default async function DashboardPage() {
   const session = await requireAuth();
-  const projects = await db.select().from(project).where(eq(project.userId, session.user.id));
+  const projects = await getProjects(session.user.id);
   return <ProjectList projects={projects} />;
+}
+```
+
+### Client Reads: Route Handlers (GET) → lib/data
+
+When a client component needs to refetch data (polling, manual refresh), expose a thin GET route handler. Server actions are POST — not cacheable by browsers or CDNs.
+
+```tsx
+// src/app/api/projects/route.ts
+import { getProjects } from "@/lib/data/projects";
+import { auth } from "@/lib/auth/server";
+import { headers } from "next/headers";
+import { NextResponse } from "next/server";
+
+export async function GET() {
+  const session = await auth.api.getSession({ headers: await headers() });
+  if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const data = await getProjects(session.user.id);
+  return NextResponse.json(data);
 }
 ```
 
@@ -134,10 +166,12 @@ toast.error("Something went wrong");
 
 | Directory | Purpose | Example |
 |---|---|---|
-| `src/actions/` | Server actions | `auth.ts`, `project.ts` |
+| `src/actions/` | Server actions (writes) | `project.ts` |
 | `src/app/` | Pages and layouts | `(app)/dashboard/page.tsx` |
+| `src/app/api/` | Route handlers (client reads) | `projects/route.ts` |
 | `src/components/` | React components | `auth/login-form.tsx` |
 | `src/components/ui/` | shadcn/ui components | `button.tsx`, `input.tsx` |
+| `src/lib/data/` | Data access functions | `projects.ts` |
 | `src/lib/db/` | Database and schema | `index.ts`, `schema.ts` |
 | `src/lib/auth/` | Auth config | `server.ts`, `client.ts`, `helpers.ts` |
 | `src/lib/validators/` | Zod schemas | `auth.ts`, `project.ts` |
@@ -150,11 +184,13 @@ toast.error("Something went wrong");
 
 1. **Schema** — Add table to `src/lib/db/schema.ts`
 2. **Validator** — Add Zod schema to `src/lib/validators/`
-3. **Action** — Add server action to `src/actions/`
-4. **Page** — Add page to `src/app/`
-5. **Form** — Add form component to `src/components/`
+3. **Data** — Add query functions to `src/lib/data/`
+4. **Action** — Add server action to `src/actions/` (writes only)
+5. **Route** — Add GET route handler to `src/app/api/` (only if client needs to refetch)
+6. **Page** — Add page to `src/app/`
+7. **Form** — Add form component to `src/components/`
 
-Or invoke the `scaffold-feature` skill to generate all five files at once.
+Or invoke the `scaffold-feature` skill to generate files at once.
 
 ## Code Style
 
@@ -173,34 +209,85 @@ Or invoke the `scaffold-feature` skill to generate all five files at once.
 
 ## Data Fetching
 
-Always use React Server Components (RSC) to fetch data. Never use useEffect or client-side fetching for initial page data.
+### Pattern 1: Server component props (default — 90% of cases)
+
+Server component fetches via `lib/data`, passes data as props to client components.
 
 ```tsx
-// CORRECT: Fetch in server component
 export default async function ProjectsPage() {
   const session = await requireAuth();
-  const projects = await db.select().from(project).where(eq(project.userId, session.user.id));
+  const projects = await getProjects(session.user.id);
   return <ProjectTable projects={projects} />;
 }
 ```
 
+### Pattern 2: Streaming with use() + Suspense (slow queries)
+
+Pass an unawaited promise from server component, client unwraps with React `use()`.
+
 ```tsx
-// WRONG: Don't do this
+// Server component — don't await
+export default function AnalyticsPage() {
+  const data = getAnalytics();
+  return (
+    <Suspense fallback={<div>Loading...</div>}>
+      <AnalyticsChart data={data} />
+    </Suspense>
+  );
+}
+
+// Client component — unwrap with use()
 "use client";
-export default function ProjectsPage() {
-  const [projects, setProjects] = useState([]);
-  useEffect(() => { fetch("/api/projects").then(...) }, []); // NO
+import { use } from "react";
+export function AnalyticsChart({ data }: { data: Promise<Analytics[]> }) {
+  const analytics = use(data);
+  return <div>{/* render */}</div>;
 }
 ```
 
-- **Reads**: Server Components → Drizzle → Postgres (no API routes, no useEffect)
-- **Mutations**: Server Actions called from client components
-- **Revalidation**: `revalidatePath()` after mutations to refresh RSC data
-- **Client state**: React Query only for polling, optimistic updates, or data that changes without navigation
+### Pattern 3: React Query + Route Handler (polling / optimistic updates)
+
+Use only when client needs to refetch without navigation. Prefetch on server with HydrationBoundary, refetch on client via GET route handler.
+
+```tsx
+// Server component — prefetch
+export default async function NotificationsPage() {
+  const queryClient = new QueryClient();
+  await queryClient.prefetchQuery({
+    queryKey: ["notifications"],
+    queryFn: () => getNotifications(session.user.id),
+  });
+  return (
+    <HydrationBoundary state={dehydrate(queryClient)}>
+      <NotificationList />
+    </HydrationBoundary>
+  );
+}
+
+// Client component — refetch via GET route handler
+"use client";
+export function NotificationList() {
+  const { data } = useQuery({
+    queryKey: ["notifications"],
+    queryFn: () => fetch("/api/notifications").then(r => r.json()),
+    refetchInterval: 10_000,
+  });
+}
+```
+
+### Data layer rules
+
+- **Data functions** (`src/lib/data/`): Shared query logic, called by server components and route handlers
+- **Server actions** (`src/actions/`): Writes only (POST) — mutations, then `revalidatePath()`
+- **Route handlers** (`src/app/api/`): Client reads only (GET) — cacheable, for React Query `queryFn`
+- **No useEffect for fetching** — use server components or React Query
+- **No server actions for reads** — they're POST, not cacheable by browsers/CDNs
 
 ## Don'ts
 
-- No API routes for CRUD — use server actions
+- No server actions for reads — they're POST, not cacheable. Use `lib/data` + route handlers
+- No useEffect for data fetching — use server components or React Query
+- No client-side fetch for initial page data — fetch in server components
 - No ESLint or Prettier — use Biome
 - No npm or yarn — use pnpm
 - No `useState` for forms — use React Hook Form
@@ -209,5 +296,3 @@ export default function ProjectsPage() {
 - No skipping Zod validation in server actions
 - No `middleware.ts` — use `proxy.ts` (Next.js 16)
 - No writing library code without checking Context7 first
-- No useEffect for data fetching — use RSC
-- No client-side fetch for initial page data — fetch in server components
