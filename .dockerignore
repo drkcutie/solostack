@@ -1,0 +1,9 @@
+node_modules
+.next
+.git
+.gitignore
+.env.local
+.env.production
+README.md
+claude.md
+docker-compose.yml
